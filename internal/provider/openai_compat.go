@@ -1,10 +1,10 @@
-// Package openrouter provides an HTTP client for the OpenRouter API.
-package openrouter
+package provider
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,25 +12,44 @@ import (
 )
 
 const (
-	defaultBaseURL    = "https://openrouter.ai/api/v1"
 	defaultMaxRetries = 3
 	defaultRetryDelay = time.Second
 	defaultTimeout    = 120 * time.Second
 )
 
-// Client is an HTTP client for the OpenRouter API.
+// apiError is returned when the API responds with a non-200 status.
+type apiError struct {
+	statusCode int
+	body       string
+}
+
+func (e *apiError) Error() string {
+	return fmt.Sprintf("API error (status %d): %s", e.statusCode, e.body)
+}
+
+// retryableStatus reports whether an HTTP status code represents a transient
+// failure worth retrying.
+func retryableStatus(code int) bool {
+	return code >= 500 || code == http.StatusTooManyRequests || code == http.StatusRequestTimeout
+}
+
+// Client is a generic OpenAI-compatible chat-completions client. Concrete
+// providers configure it with a base URL and any provider-specific headers.
 type Client struct {
-	httpClient *http.Client
-	apiKey     string
-	baseURL    string
-	maxRetries int
-	retryDelay time.Duration
+	httpClient       *http.Client
+	apiKey           string
+	baseURL          string
+	headers          map[string]string
+	maxRetries       int
+	retryDelay       time.Duration
+	providerFallback func(model string) string
 }
 
 // Option configures a Client.
 type Option func(*Client)
 
-// WithBaseURL sets a custom base URL for the API.
+// WithBaseURL sets the base URL for the API. The client appends
+// "/chat/completions" to it.
 func WithBaseURL(url string) Option {
 	return func(c *Client) {
 		c.baseURL = url
@@ -59,12 +78,29 @@ func WithTimeout(timeout time.Duration) Option {
 	}
 }
 
-// NewClient creates a new OpenRouter API client.
-func NewClient(apiKey string, opts ...Option) *Client {
+// WithHeader sets a static header sent with every request.
+func WithHeader(key, value string) Option {
+	return func(c *Client) {
+		c.headers[key] = value
+	}
+}
+
+// WithProviderFallback sets a function that derives a provider name from the
+// model when the API response does not include one.
+func WithProviderFallback(fn func(model string) string) Option {
+	return func(c *Client) {
+		c.providerFallback = fn
+	}
+}
+
+// New creates a generic OpenAI-compatible client. apiKey may be empty to omit
+// the Authorization header, for gateways that supply provider credentials
+// themselves.
+func New(apiKey string, opts ...Option) *Client {
 	c := &Client{
 		httpClient: &http.Client{Timeout: defaultTimeout},
 		apiKey:     apiKey,
-		baseURL:    defaultBaseURL,
+		headers:    make(map[string]string),
 		maxRetries: defaultMaxRetries,
 		retryDelay: defaultRetryDelay,
 	}
@@ -73,6 +109,8 @@ func NewClient(apiKey string, opts ...Option) *Client {
 	}
 	return c
 }
+
+var _ Provider = (*Client)(nil)
 
 // Message represents a chat message.
 type Message struct {
@@ -84,7 +122,7 @@ type Message struct {
 
 // ResponseFormat specifies the structured output format.
 type ResponseFormat struct {
-	// Type is the type of response format, either "json_schema".
+	// Type is the type of response format, e.g. "json_schema".
 	Type string `json:"type"`
 	// JSONSchema is the structured output schema for the response.
 	JSONSchema json.RawMessage `json:"json_schema,omitempty"`
@@ -122,26 +160,13 @@ type ChatResponse struct {
 	ID string `json:"id"`
 	// Model is the name of the model that completed the request.
 	Model string `json:"model"`
-	// Provider is the provider that OpenRouter used to complete the request.
+	// Provider is the upstream provider that served the request. Not every
+	// OpenAI-compatible backend sets it.
 	Provider string `json:"provider"`
 	// Choices is the list of choices from the model.
 	Choices []Choice `json:"choices"`
 	// Usage is the token usage for the request.
 	Usage Usage `json:"usage"`
-}
-
-// CompletionResult contains the response and timing information.
-type CompletionResult struct {
-	// Response is the raw JSON response from the model.
-	Response json.RawMessage
-	// Provider is the provider that OpenRouter used to complete the request.
-	Provider string
-	// TokensIn is the number of tokens in the prompt.
-	TokensIn int
-	// TokensOut is the number of tokens in the completion.
-	TokensOut int
-	// Latency is the latency of the request.
-	Latency time.Duration
 }
 
 // Complete sends a chat completion request with structured output.
@@ -151,7 +176,7 @@ func (c *Client) Complete(ctx context.Context, model, systemPrompt, userInput st
 		{Role: "user", Content: userInput},
 	}
 
-	// Wrap the schema in the required format for OpenRouter
+	// Wrap the schema in the format expected by OpenAI-compatible APIs.
 	wrappedSchema := map[string]any{
 		"name":   "response",
 		"strict": true,
@@ -192,6 +217,12 @@ func (c *Client) Complete(ctx context.Context, model, systemPrompt, userInput st
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+
+		// Don't retry terminal client errors.
+		var apiErr *apiError
+		if errors.As(lastErr, &apiErr) && !retryableStatus(apiErr.statusCode) {
+			return nil, lastErr
+		}
 	}
 
 	return nil, fmt.Errorf("failed after %d retries: %w", c.maxRetries, lastErr)
@@ -209,9 +240,12 @@ func (c *Client) doRequest(ctx context.Context, chatReq ChatRequest) (*Completio
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	req.Header.Set("HTTP-Referer", "https://github.com/litmus-cli/litmus")
-	req.Header.Set("X-Title", "Litmus CLI")
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	for k, v := range c.headers {
+		req.Header.Set(k, v)
+	}
 
 	start := time.Now()
 	resp, err := c.httpClient.Do(req)
@@ -228,7 +262,7 @@ func (c *Client) doRequest(ctx context.Context, chatReq ChatRequest) (*Completio
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody))
+		return nil, &apiError{statusCode: resp.StatusCode, body: string(respBody)}
 	}
 
 	var chatResp ChatResponse
@@ -242,11 +276,18 @@ func (c *Client) doRequest(ctx context.Context, chatReq ChatRequest) (*Completio
 
 	content := chatResp.Choices[0].Message.Content
 
-	return &CompletionResult{
+	result := &CompletionResult{
 		Response:  json.RawMessage(content),
 		Provider:  chatResp.Provider,
 		TokensIn:  chatResp.Usage.PromptTokens,
 		TokensOut: chatResp.Usage.CompletionTokens,
 		Latency:   latency,
-	}, nil
+	}
+
+	// Fall back to a derived provider name when the backend omits one.
+	if result.Provider == "" && c.providerFallback != nil {
+		result.Provider = c.providerFallback(chatReq.Model)
+	}
+
+	return result, nil
 }
